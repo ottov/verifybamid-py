@@ -206,10 +206,11 @@ def run(cram_url, ref, panel_path, *, crai_url=None, out=None, contigs=None,
             gs.append(i)
     n_work = sum(len(v[0]) for v in by_contig.values())
 
-    # contiguous per-contig chunks, sized so each job gets ~8 chunks. max_span caps
-    # the genomic span per chunk: leave it None for a dense panel (one big sequential
-    # read), set it (~100-200kb) for a sparse/downsampled panel so each fetch pulls
-    # only the slice(s) around its markers instead of everything in between.
+    # contiguous per-contig chunks, sized so each job gets ~8 chunks. max_span caps the
+    # genomic span per chunk: leave it None for a dense panel (one big sequential read);
+    # for a sparse/downsampled panel ~1000000 is the measured egress optimum. Counter-
+    # intuitively WIDER spans pull LESS: one sequential fetch decodes each CRAM slice
+    # once, whereas many narrow fetches re-read overlapping slices.
     chunk_target = max(1000, n_work // max(jobs * 8, 1))
     chunks = []
     for c, (ps, gs) in by_contig.items():
@@ -291,7 +292,8 @@ def main(argv=None):
                    help="restrict to contig(s); repeatable")
     p.add_argument("--jobs", type=int, default=1)
     p.add_argument("--max-span", type=int,
-                   help="cap genomic span (bp) per fetch; set ~150000 for sparse panels")
+                   help="cap genomic span (bp) per fetch; ~1000000 is the measured egress "
+                        "optimum for sparse panels (wider spans pull LESS data)")
     p.add_argument("--min-mapq", type=int)
     p.add_argument("--min-q", type=int)
     p.add_argument("--max-q", type=int)

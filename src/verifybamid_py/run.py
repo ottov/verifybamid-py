@@ -86,7 +86,8 @@ def main(argv=None):
     p.add_argument("--contig", action="append", dest="contigs",
                    help="restrict to contig(s); repeatable (mainly for testing)")
     p.add_argument("--max-span", type=int,
-                   help="cap fetch span (bp); set ~150000 with a downsampled panel")
+                   help="cap genomic span (bp) per fetch; ~1000000 is the measured egress "
+                        "optimum with a downsampled panel (wider spans pull LESS data)")
     p.add_argument("--keep-pileup", action="store_true",
                    help="keep <out>.pileup/.markers.parquet (default: write then reuse)")
     p.add_argument("--region", default=os.environ.get("AWS_REGION", "us-east-1"))
@@ -121,43 +122,22 @@ def main(argv=None):
     d = estimate.load(f"{a.out}.markers.parquet", f"{a.out}.pileup.parquet", max_q=a.max_q)
     freemix, freelk1, freelk0 = estimate.optimize(d, d["gfo"], grid=a.grid, max_alpha=0.5)
 
-    chip = ["NA", "NA", "NA"]
-    chip_id_out = "NA"
+    # CHIPMIX columns stay "vs the CLAIMED sample" (the contamination number), so they're
+    # comparable across the cohort whether or not --best ran; see estimate.chip_columns.
+    chip, chip_id_out, scan, swap = estimate.chip_columns(
+        d, chip_matrix=a.chip_matrix, chip_vcf=a.chip_vcf, chip_id=a.chip_id,
+        seq_id=seq_id, markers_path=f"{a.out}.markers.parquet", best=a.best, grid=a.grid)
     if a.best:
-        if not a.chip_matrix:
-            sys.exit("--best requires --chip-matrix")
         self_id = a.chip_id or seq_id
-        res = estimate.scan_chip(d, a.chip_matrix, self_id=self_id, grid=a.grid)
-        best_id, best_cmix = res["best"][0], res["best"][1]
-        # Standard CHIPMIX columns stay "vs the CLAIMED sample" (the contamination
-        # number), so they're comparable across the cohort whether or not --best ran.
-        if res["self"] is not None:
-            _, cmix, clk1, clk0 = res["self"]
-            chip = [f"{cmix:.5f}", f"{clk1:.2f}", f"{clk0:.2f}"]
-            chip_id_out = self_id
-            swap = "NO" if best_id == self_id else "YES"
-        else:
-            swap = "NA"                  # claimed id not genotyped -> swap unconfirmable
+        best_id, best_cmix = scan["best"][0], scan["best"][1]
         _write_best(f"{a.out}.best.tsv", seq_id, best_id, best_cmix, chip[0], swap,
-                    res["ranking"])
+                    scan["ranking"])
         if swap == "YES":
             print(f"[verifybamid] ** SWAP: reads best-match {best_id}, not claimed "
                   f"{self_id} **", file=sys.stderr)
         else:
             print(f"[verifybamid] identity: best-match={best_id} swap={swap}",
                   file=sys.stderr)
-    elif a.chip_matrix or a.chip_vcf:
-        if a.chip_matrix:
-            from . import build_chip
-            sg = build_chip.load_sample(a.chip_matrix, a.chip_id or seq_id)
-        else:
-            sg = estimate.extract_self_geno(a.chip_vcf, a.chip_id or seq_id,
-                                            f"{a.out}.markers.parquet")
-        if sg is not None:                       # None = sample absent -> CHIPMIX NA
-            cmix, clk1, clk0 = estimate.optimize(d, estimate.chip_weights(d, sg),
-                                                 grid=a.grid, max_alpha=0.95)
-            chip = [f"{cmix:.5f}", f"{clk1:.2f}", f"{clk0:.2f}"]
-            chip_id_out = a.chip_id or seq_id
 
     row = [seq_id, "ALL", chip_id_out, str(counts["n_snps"]), str(counts["n_reads"]),
            f"{counts['avg_dp']:.2f}", f"{freemix:.5f}", f"{freelk1:.2f}",
@@ -175,7 +155,7 @@ def main(argv=None):
             except OSError:
                 pass
 
-    chip_msg = f"  CHIPMIX={chip[0]}" if a.chip_vcf else ""
+    chip_msg = f"  CHIPMIX={chip[0]}" if chip[0] != "NA" else ""
     print(f"[verifybamid] FREEMIX={freemix:.5f}  FREELK1={freelk1:.2f}  "
           f"FREELK0={freelk0:.2f}{chip_msg}  -> {self_sm}", file=sys.stderr)
     print("\t".join(SELF_SM_HEADER))

@@ -108,28 +108,15 @@ def optimize(d, w, grid=0.05, max_alpha=0.5):
     symmetry, so it can scan higher and even flag sample swaps (alpha -> 1).
     """
     alphas = np.arange(0.0, max_alpha + 1e-9, grid)
-    lks = np.array([neg_llk(1.0 - a, d, w) for a in alphas])
-    k = int(lks.argmin())
-    llk0 = float(lks[0])  # alpha = 0
-
-    if k == 0:
-        lo, hi = 0.0, grid
-    elif k == len(alphas) - 1:
-        lo, hi = alphas[k - 1], max_alpha
-    else:
-        lo, hi = alphas[k - 1], alphas[k + 1]
-    res = minimize_scalar(lambda a: neg_llk(1.0 - a, d, w), bounds=(lo, hi),
-                          method="bounded", options={"xatol": 1e-4})
-    alpha_opt, llk1 = float(res.x), float(res.fun)
-    if llk1 > llk0:
-        alpha_opt, llk1 = 0.0, llk0
-    return alpha_opt, llk1, llk0
+    grid_lks = np.array([neg_llk(1.0 - a, d, w) for a in alphas])
+    return _refine_alpha(d, w, alphas, grid_lks)
 
 
 def _refine_alpha(d, w, alphas, grid_lks):
-    """Brent-refine alpha around the grid argmin for one individual's chip weights.
-    grid_lks (neg-llk per grid alpha) only locates the bracket; the refined value and
-    llk0 are recomputed from w so they're self-consistent. Returns (chipmix,lk1,lk0).
+    """Brent-refine the contamination alpha around the grid argmin of grid_lks (neg-llk
+    per grid alpha). grid_lks only locates the bracket; the refined optimum and llk0 are
+    recomputed from w so they're self-consistent. Returns (alpha, lk1, lk0). Shared by
+    optimize() (FREE / single-chip) and scan_chip() (per-individual --best refine).
     """
     k = int(grid_lks.argmin())
     lo = alphas[max(k - 1, 0)]
@@ -231,6 +218,42 @@ def extract_self_geno(chip_vcf, sample_id, markers_path):
     return geno
 
 
+def chip_columns(d, *, chip_matrix=None, chip_vcf=None, chip_id=None, seq_id=None,
+                 markers_path=None, best=False, grid=0.05):
+    """CHIPMIX/CHIPLK columns for the .selfSM -- the shared CHIP path for both CLIs.
+
+    Returns (cols, chip_id_out, scan, swap):
+      cols        [CHIPMIX, CHIPLK1, CHIPLK0] formatted strings (["NA"]*3 if no geno)
+      chip_id_out value for the CHIP_ID column ("NA" if no chip genotype was used)
+      scan        scan_chip() dict when best=True, else None
+      swap        "NO"/"YES"/"NA" when best=True, else None
+    CHIPMIX stays "vs the CLAIMED sample" (chip_id or seq_id) so it is comparable across
+    the cohort whether or not --best ran. The chip_vcf path needs markers_path.
+    """
+    none = (["NA", "NA", "NA"], "NA", None, None)
+    self_id = chip_id or seq_id
+    if best:
+        if not chip_matrix:
+            sys.exit("--best requires --chip-matrix (it scans all individuals' genotypes)")
+        scan = scan_chip(d, chip_matrix, self_id=self_id, grid=grid)
+        if scan["self"] is None:                     # claimed id not genotyped -> unconfirmable
+            return ["NA", "NA", "NA"], "NA", scan, "NA"
+        _, cmix, clk1, clk0 = scan["self"]
+        swap = "NO" if scan["best"][0] == self_id else "YES"
+        return [f"{cmix:.5f}", f"{clk1:.2f}", f"{clk0:.2f}"], self_id, scan, swap
+    if chip_matrix or chip_vcf:
+        if chip_matrix:
+            from . import build_chip
+            sg = build_chip.load_sample(chip_matrix, self_id)
+        else:
+            sg = extract_self_geno(chip_vcf, self_id, markers_path)
+        if sg is None:                               # sample absent -> CHIPMIX NA
+            return none
+        cmix, clk1, clk0 = optimize(d, chip_weights(d, sg), grid=grid, max_alpha=0.95)
+        return [f"{cmix:.5f}", f"{clk1:.2f}", f"{clk0:.2f}"], self_id, None, None
+    return none
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Estimate FREEMIX/FREELK (+CHIPMIX) from pileup.")
     ap.add_argument("--markers", required=True, help="<prefix>.markers.parquet")
@@ -249,36 +272,15 @@ def main(argv=None):
     d = load(a.markers, a.pileup, max_q=a.max_q)
     freemix, freelk1, freelk0 = optimize(d, d["gfo"], grid=a.grid, max_alpha=0.5)
 
-    chip = ["NA", "NA", "NA"]
-    chip_id_out = "NA"
+    chip, chip_id_out, scan, swap = chip_columns(
+        d, chip_matrix=a.chip_matrix, chip_vcf=a.chip_vcf, chip_id=a.chip_id,
+        seq_id=a.seq_id, markers_path=a.markers, best=a.best, grid=a.grid)
     if a.best:
-        if not a.chip_matrix:
-            sys.exit("--best requires --chip-matrix (it scans all individuals' genotypes)")
-        self_id = a.chip_id or a.seq_id
-        res = scan_chip(d, a.chip_matrix, self_id=self_id, grid=a.grid)
-        best_id = res["best"][0]
-        if res["self"] is not None:               # CHIPMIX columns = vs CLAIMED self
-            _, cmix, clk1, clk0 = res["self"]
-            chip = [f"{cmix:.5f}", f"{clk1:.2f}", f"{clk0:.2f}"]
-            chip_id_out = self_id
-            swap = "NO" if best_id == self_id else "YES"
-        else:
-            swap = "NA"                            # claimed id not genotyped -> unconfirmable
-        rank = "; ".join(f"{i}:{al}" for i, al, _ in res["ranking"])
-        print(f"BEST_MATCH={best_id}  SWAP={swap}  best_chipmix={res['best'][1]:.5f}  "
+        rank = "; ".join(f"{i}:{al}" for i, al, _ in scan["ranking"])
+        print(f"BEST_MATCH={scan['best'][0]}  SWAP={swap}  best_chipmix={scan['best'][1]:.5f}  "
               f"self_chipmix={chip[0]}  top={rank}", file=sys.stderr)
-    elif a.chip_matrix or a.chip_vcf:
-        if a.chip_matrix:
-            from . import build_chip
-            sg = build_chip.load_sample(a.chip_matrix, a.chip_id or a.seq_id)
-        else:
-            sg = extract_self_geno(a.chip_vcf, a.chip_id or a.seq_id, a.markers)
-        if sg is not None:
-            w = chip_weights(d, sg)
-            chipmix, chiplk1, chiplk0 = optimize(d, w, grid=a.grid, max_alpha=0.95)
-            chip = [f"{chipmix:.5f}", f"{chiplk1:.2f}", f"{chiplk0:.2f}"]
-            chip_id_out = a.chip_id or a.seq_id
-            print(f"CHIPMIX={chip[0]}  CHIPLK1={chip[1]}  CHIPLK0={chip[2]}", file=sys.stderr)
+    elif chip[0] != "NA":
+        print(f"CHIPMIX={chip[0]}  CHIPLK1={chip[1]}  CHIPLK0={chip[2]}", file=sys.stderr)
 
     print(f"FREEMIX={freemix:.5f}  FREELK1={freelk1:.2f}  FREELK0={freelk0:.2f}",
           file=sys.stderr)
