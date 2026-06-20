@@ -166,7 +166,8 @@ def main(argv=None):
     ap.add_argument("--pileup", required=True, help="<prefix>.pileup.parquet")
     ap.add_argument("--seq-id", default="SAMPLE")
     ap.add_argument("--chip-vcf", help="VCF with the sample's genotypes -> enables CHIPMIX")
-    ap.add_argument("--chip-id", help="sample id in --chip-vcf (default: --seq-id)")
+    ap.add_argument("--chip-matrix", help="precomputed chip matrix (build-chip) -> CHIPMIX")
+    ap.add_argument("--chip-id", help="sample id in chip source (default: --seq-id)")
     ap.add_argument("--max-q", type=int, default=40)
     ap.add_argument("--grid", type=float, default=0.05)
     a = ap.parse_args(argv)
@@ -175,8 +176,12 @@ def main(argv=None):
     freemix, freelk1, freelk0 = optimize(d, d["gfo"], grid=a.grid, max_alpha=0.5)
 
     chip = ["NA", "NA", "NA"]
-    if a.chip_vcf:
-        sg = extract_self_geno(a.chip_vcf, a.chip_id or a.seq_id, a.markers)
+    if a.chip_matrix or a.chip_vcf:
+        if a.chip_matrix:
+            from . import build_chip
+            sg = build_chip.load_sample(a.chip_matrix, a.chip_id or a.seq_id)
+        else:
+            sg = extract_self_geno(a.chip_vcf, a.chip_id or a.seq_id, a.markers)
         if sg is not None:
             w = chip_weights(d, sg)
             chipmix, chiplk1, chiplk0 = optimize(d, w, grid=a.grid, max_alpha=0.95)

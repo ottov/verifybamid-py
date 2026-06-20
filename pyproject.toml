@@ -19,6 +19,7 @@ dependencies = [
 [project.scripts]
 verifybamid = "verifybamid_py.run:main"
 build-panel = "verifybamid_py.build_panel:main"
+build-chip = "verifybamid_py.build_chip:main"
 downsample = "verifybamid_py.downsample:main"
 pileup = "verifybamid_py.pileup:main"
 estimate = "verifybamid_py.estimate:main"

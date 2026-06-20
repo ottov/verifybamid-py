@@ -63,7 +63,8 @@ def main(argv=None):
     p.add_argument("--out", required=True, help="output prefix (writes <out>.selfSM)")
     p.add_argument("--seq-id", help="sample id (default: @RG SM, else filename)")
     p.add_argument("--chip-vcf", help="VCF with the sample's genotypes -> also compute CHIPMIX")
-    p.add_argument("--chip-id", help="sample id within --chip-vcf (default: --seq-id)")
+    p.add_argument("--chip-matrix", help="precomputed chip matrix (build-chip) -> CHIPMIX")
+    p.add_argument("--chip-id", help="sample id within chip source (default: --seq-id)")
     p.add_argument("--jobs", type=int, default=1)
     p.add_argument("--contig", action="append", dest="contigs",
                    help="restrict to contig(s); repeatable (mainly for testing)")
@@ -95,9 +96,13 @@ def main(argv=None):
     freemix, freelk1, freelk0 = estimate.optimize(d, d["gfo"], grid=a.grid, max_alpha=0.5)
 
     chip = ["NA", "NA", "NA"]
-    if a.chip_vcf:
-        sg = estimate.extract_self_geno(a.chip_vcf, a.chip_id or seq_id,
-                                        f"{a.out}.markers.parquet")
+    if a.chip_matrix or a.chip_vcf:
+        if a.chip_matrix:
+            from . import build_chip
+            sg = build_chip.load_sample(a.chip_matrix, a.chip_id or seq_id)
+        else:
+            sg = estimate.extract_self_geno(a.chip_vcf, a.chip_id or seq_id,
+                                            f"{a.out}.markers.parquet")
         if sg is not None:                       # None = sample absent -> CHIPMIX NA
             cmix, clk1, clk0 = estimate.optimize(d, estimate.chip_weights(d, sg),
                                                  grid=a.grid, max_alpha=0.95)
