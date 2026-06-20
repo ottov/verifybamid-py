@@ -10,6 +10,59 @@ Validated bit-for-bit against verifyBamID 1.1.3 across the full contamination sp
 clean (FREEMIX 0.000), low (0.014), and high (0.454), with FREELK matching to the cent
 on the matching panel and CHIPMIX to 1e-5.
 
+## Cluster quickstart (SLURM)
+
+Run a whole project (10,000s of CRAMs sharing one panel) as a Nextflow pipeline that
+submits one streaming SLURM job per sample. Needs **Java 17+, Nextflow, `uv`, and the
+`aws` CLI** on the cluster, plus a **shared filesystem** visible to all compute nodes.
+
+```bash
+# 1. clone + install
+git clone git@github.com:ottov/verifybamid-py.git
+cd verifybamid-py
+uv sync                       # builds .venv/ with the verifybamid commands
+
+# 2. one-time prerequisites
+ls /shared/ref/GRCh38_full_analysis_set_plus_decoy_hla.fa{,.fai}   # ref + .fai, shared
+aws configure                 # AWS creds readable on COMPUTE nodes (NFS-shared ~/.aws)
+
+# 3. sample sheet: TSV, NO header, tab-separated
+#    sample_id <TAB> s3://bucket/project/PANEL_PREFIX <TAB> s3://bucket/path/sample.cram
+#    (".vcf.gz" is appended to PANEL_PREFIX; the panel is shared by all samples in it)
+
+# 4. launch (submits to SLURM by default); run from the repo root
+nextflow run nextflow/main.nf -c nextflow/nextflow.config \
+  --samples /path/to/sample_list.tsv \
+  --ref     /shared/ref/GRCh38_full_analysis_set_plus_decoy_hla.fa \
+  --bindir  "$PWD/.venv/bin" \
+  --region  us-east-1 \
+  -resume
+```
+
+The run builds the marker panel + CHIP matrix **once per project** (cached in `panels/`,
+reused on re-runs) and streams each CRAM as an independent SLURM job. Outputs land in
+`results/`:
+
+- `contamination.selfSM` — merged table, one row per sample (`FREEMIX`, `FREELK1/0`, `CHIPMIX`, …)
+- `failed_samples.txt` — samples that failed after retries (empty if all passed; re-run by
+  trimming the sheet to these and re-launching with `-resume`)
+- `_report.html` / `_timeline.html` / `_trace.txt` — run stats
+
+Knobs (as `--flag value`, or edit `nextflow/nextflow.config`):
+
+| flag | default | when to change |
+|---|---|---|
+| `--max_streams` | `8` | concurrent S3 streams. **Raise a lot in-region/AWS**; lower if coverage-guard retries appear over a thin WAN. |
+| `--cpus` | `2` | cores per sample; 2–4 is the sweet spot. |
+| `--chipmix` | `true` | set `false` if the sample isn't in the project genotype VCF (then `FREEMIX` only). |
+| `--fast_n` | `20000` | markers; 20k is well-validated. |
+| `-profile local` | (slurm) | run on one node instead of submitting to SLURM (testing). |
+
+> **It's WAN-bandwidth-bound** (~14 GB/sample), not CPU-bound — see "Scaling / egress"
+> below. `-resume` makes failures/preemptions cheap to recover.
+
+The rest of this README covers the single-sample / per-stage commands the pipeline calls.
+
 ## Install
 
 ```bash
