@@ -1,0 +1,28 @@
+[project]
+name = "verifybamid-py"
+version = "0.1.0"
+description = "Streaming reimplementation of verifyBamID FREEMIX/FREELK for S3 CRAMs"
+readme = "README.md"
+authors = [
+    { name = "ottov", email = "ottomatedsolutions@gmail.com" }
+]
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "boto3>=1.43.33",
+    "cyvcf2>=0.31.0",
+    "numpy>=1.26",
+    "pyarrow>=15",
+    "pysam>=0.24.0",
+    "scipy>=1.17.1",
+]
+
+[project.scripts]
+verifybamid = "verifybamid_py.run:main"
+build-panel = "verifybamid_py.build_panel:main"
+downsample = "verifybamid_py.downsample:main"
+pileup = "verifybamid_py.pileup:main"
+estimate = "verifybamid_py.estimate:main"
+
+[build-system]
+requires = ["uv_build>=0.11.21,<0.12.0"]
+build-backend = "uv_build"
