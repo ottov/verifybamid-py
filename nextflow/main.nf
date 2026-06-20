@@ -52,7 +52,21 @@ workflow {
     jobs = rows.combine(artifacts, by: 0)            // (prefix, sample, cram, panel, chip)
 
     VERIFYBAMID(jobs)
-    MERGE(VERIFYBAMID.out.selfsm.collect())
+
+    // Merge per-sample rows into one table, single header. collectFile streams the
+    // concatenation (no giant arg list / 100k files staged into one task like a
+    // collect()+process would), and drops each file's header but the first.
+    VERIFYBAMID.out.selfsm
+        .collectFile(name: 'contamination.selfSM', storeDir: params.outdir,
+                     keepHeader: true, skip: 1, sort: true)
+
+    // Failed-sample manifest = requested ids minus ids that produced a .selfSM
+    // (terminally-failed samples are 'ignore'd above, so they just never appear).
+    all_ids = rows.map { it[1] }
+        .collectFile(name: 'all_ids.txt', newLine: true, sort: true)
+    ok_ids  = VERIFYBAMID.out.selfsm.map { it.baseName }
+        .collectFile(name: 'ok_ids.txt', newLine: true, sort: true)
+    REPORT(all_ids, ok_ids)
 }
 
 /*
@@ -124,7 +138,11 @@ process VERIFYBAMID {
     cpus params.cpus
     memory params.mem
     time params.time
-    errorStrategy 'retry'
+    maxForks params.max_streams            // S3-stream throttle (see config)
+    // Retry transient failures (S3 throttle -> coverage-guard exit, preemption);
+    // after that, IGNORE so one bad CRAM can't abort a 100k-sample batch. Ignored
+    // samples emit no .selfSM and are listed in failed_samples.txt by REPORT.
+    errorStrategy { task.attempt <= 2 ? 'retry' : 'ignore' }
     maxRetries 2
 
     input:
@@ -146,30 +164,34 @@ process VERIFYBAMID {
         ${chip_arg} ${fast_arg} \
         --seq-id ${sample} \
         --jobs ${task.cpus} \
+        --expires ${params.presign_expires} \
         --out ${sample}
     """
 }
 
 /*
- * Concatenate per-sample .selfSM into one project table (single header).
+ * Write failed_samples.txt = requested ids that produced no .selfSM (terminal
+ * failures after retries). Empty file when every sample succeeded.
  */
-process MERGE {
+process REPORT {
     publishDir "${params.outdir}", mode: 'copy'
     cpus 1
-    memory '2 GB'
-    time '30m'
+    memory '1 GB'
+    time '15m'
 
     input:
-    path rows
+    path all_ids
+    path ok_ids
 
     output:
-    path "contamination.selfSM"
+    path "failed_samples.txt"
 
     script:
     """
     set -e
-    first=\$(echo ${rows} | tr ' ' '\\n' | head -1)
-    head -1 "\$first" > contamination.selfSM
-    for f in ${rows}; do tail -n +2 "\$f" >> contamination.selfSM; done
+    sort -u ${all_ids} > a.txt
+    sort -u ${ok_ids}  > o.txt
+    comm -23 a.txt o.txt > failed_samples.txt || true
+    echo "[report] \$(wc -l < failed_samples.txt) sample(s) failed after retries" >&2
     """
 }
