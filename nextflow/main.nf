@@ -67,6 +67,11 @@ workflow {
     ok_ids  = VERIFYBAMID.out.selfsm.map { it.baseName }
         .collectFile(name: 'ok_ids.txt', newLine: true, sort: true)
     REPORT(all_ids, ok_ids)
+
+    // Identity / sample-swap scan (only when --best); one row per sample, swap flagged.
+    VERIFYBAMID.out.best
+        .collectFile(name: 'identity_scan.tsv', storeDir: params.outdir,
+                     keepHeader: true, skip: 1, sort: true)
 }
 
 /*
@@ -134,7 +139,7 @@ process CHIP {
  */
 process VERIFYBAMID {
     tag "${sample}"
-    publishDir "${params.outdir}", mode: 'copy', pattern: '*.selfSM'
+    publishDir "${params.outdir}", mode: 'copy', pattern: '*.{selfSM,best.tsv}'
     cpus params.cpus
     memory params.mem
     time params.time
@@ -150,6 +155,7 @@ process VERIFYBAMID {
 
     output:
     path "${sample}.selfSM", emit: selfsm
+    path "${sample}.best.tsv", optional: true, emit: best   // only when --best
 
     script:
     def chip_arg = chip.name == 'NO_CHIP' ? '' :

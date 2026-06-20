@@ -24,6 +24,17 @@ SELF_SM_HEADER = [
     "CHIP_RA", "DPREF", "RDPHET", "RDPALT",
 ]
 
+# Identity / sample-swap sidecar written by --best (separate from the contamination
+# .selfSM: CHIPMIX there stays "vs the claimed sample", this carries the scan result).
+BEST_SM_HEADER = ["#SEQ_ID", "BEST_ID", "BEST_CHIPMIX", "SELF_CHIPMIX", "SWAP", "TOP_MATCHES"]
+
+
+def _write_best(path, seq_id, best_id, best_cmix, self_cmix, swap, ranking):
+    top = ";".join(f"{i}:{al}" for i, al, _ in ranking)
+    with open(path, "w") as fh:
+        fh.write("\t".join(BEST_SM_HEADER) + "\n")
+        fh.write("\t".join([seq_id, best_id, f"{best_cmix:.5f}", self_cmix, swap, top]) + "\n")
+
 
 def _presign(s3_uri: str, expires: int, region: str) -> str:
     import boto3
@@ -115,11 +126,25 @@ def main(argv=None):
     if a.best:
         if not a.chip_matrix:
             sys.exit("--best requires --chip-matrix")
-        best_id, cmix, clk1, clk0 = estimate.optimize_best(d, a.chip_matrix, grid=a.grid)
-        chip = [f"{cmix:.5f}", f"{clk1:.2f}", f"{clk0:.2f}"]
-        chip_id_out = best_id
-        if best_id != seq_id:
-            print(f"[verifybamid] ** SWAP: best-match {best_id} != seq-id {seq_id} **",
+        self_id = a.chip_id or seq_id
+        res = estimate.scan_chip(d, a.chip_matrix, self_id=self_id, grid=a.grid)
+        best_id, best_cmix = res["best"][0], res["best"][1]
+        # Standard CHIPMIX columns stay "vs the CLAIMED sample" (the contamination
+        # number), so they're comparable across the cohort whether or not --best ran.
+        if res["self"] is not None:
+            _, cmix, clk1, clk0 = res["self"]
+            chip = [f"{cmix:.5f}", f"{clk1:.2f}", f"{clk0:.2f}"]
+            chip_id_out = self_id
+            swap = "NO" if best_id == self_id else "YES"
+        else:
+            swap = "NA"                  # claimed id not genotyped -> swap unconfirmable
+        _write_best(f"{a.out}.best.tsv", seq_id, best_id, best_cmix, chip[0], swap,
+                    res["ranking"])
+        if swap == "YES":
+            print(f"[verifybamid] ** SWAP: reads best-match {best_id}, not claimed "
+                  f"{self_id} **", file=sys.stderr)
+        else:
+            print(f"[verifybamid] identity: best-match={best_id} swap={swap}",
                   file=sys.stderr)
     elif a.chip_matrix or a.chip_vcf:
         if a.chip_matrix:

@@ -86,44 +86,6 @@ def chip_weights(d, self_geno, geno_error=GENO_ERROR):
     return (genoprob[:, :, None] * gf[:, None, :]).reshape(nu, 9)  # w1[k1]*w2[k2]
 
 
-def optimize_best(d, chip_matrix_path, grid=0.05, max_alpha=0.95):
-    """Scan every individual in the chip matrix and return the best-matching one.
-
-    Replicates verifyBamID --best (Main.cpp:319-353): the best match is the
-    individual giving the highest IBD = lowest contamination alpha. The per-marker
-    base likelihood (seg) depends only on alpha, not the individual, so it is
-    precomputed once at the grid points and reused across all individuals (cheap
-    weight-combine each) -- making the all-vs-one scan affordable.
-
-    Returns (best_id, chipmix, chiplk1, chiplk0).
-    """
-    tbl = pq.read_table(chip_matrix_path)
-    sample_ids = tbl.schema.names
-    alphas = np.arange(0.0, max_alpha + 1e-9, grid)
-    seg_e = [np.exp(_seg(1.0 - a, d)) for a in alphas]   # precomputed, shared
-
-    best_id = best_k = None
-    best_alpha = best_lks = None
-    for sid in sample_ids:
-        w = chip_weights(d, np.asarray(tbl.column(sid), dtype=np.int8))
-        lks = np.array([-np.log((se * w).sum(axis=1)).sum() for se in seg_e])
-        k = int(lks.argmin())
-        if best_alpha is None or alphas[k] < best_alpha:
-            best_id, best_k, best_alpha, best_lks = sid, k, alphas[k], lks
-
-    # Brent-refine contamination for the winning individual
-    w = chip_weights(d, np.asarray(tbl.column(best_id), dtype=np.int8))
-    llk0 = float(best_lks[0])
-    lo = alphas[max(best_k - 1, 0)]
-    hi = alphas[min(best_k + 1, len(alphas) - 1)]
-    res = minimize_scalar(lambda a: neg_llk(1.0 - a, d, w), bounds=(lo, hi),
-                          method="bounded", options={"xatol": 1e-4})
-    chipmix, chiplk1 = float(res.x), float(res.fun)
-    if chiplk1 > llk0:
-        chipmix, chiplk1 = 0.0, llk0
-    return best_id, chipmix, chiplk1, llk0
-
-
 def _seg(fmix, d):
     """markerLK in log space, (nu, 9) -- shared by FREE and CHIP."""
     A = (fmix * PSN_REF[:, None] + (1 - fmix) * PSN_REF[None, :]).ravel()
@@ -162,6 +124,77 @@ def optimize(d, w, grid=0.05, max_alpha=0.5):
     if llk1 > llk0:
         alpha_opt, llk1 = 0.0, llk0
     return alpha_opt, llk1, llk0
+
+
+def _refine_alpha(d, w, alphas, grid_lks):
+    """Brent-refine alpha around the grid argmin for one individual's chip weights.
+    grid_lks (neg-llk per grid alpha) only locates the bracket; the refined value and
+    llk0 are recomputed from w so they're self-consistent. Returns (chipmix,lk1,lk0).
+    """
+    k = int(grid_lks.argmin())
+    lo = alphas[max(k - 1, 0)]
+    hi = alphas[min(k + 1, len(alphas) - 1)]
+    res = minimize_scalar(lambda a: neg_llk(1.0 - a, d, w), bounds=(lo, hi),
+                          method="bounded", options={"xatol": 1e-4})
+    llk0 = neg_llk(1.0, d, w)                       # alpha = 0, same w-path
+    chipmix, lk1 = float(res.x), float(res.fun)
+    if lk1 > llk0:
+        chipmix, lk1 = 0.0, llk0
+    return chipmix, lk1, llk0
+
+
+def scan_chip(d, chip_matrix_path, self_id=None, grid=0.05, max_alpha=0.95, top=3):
+    """Scan every individual in the chip matrix against the reads (verifyBamID --best,
+    Main.cpp:319-353): for each individual fit contamination alpha; the BEST match is
+    the lowest-alpha (highest-IBD) individual. Also returns the result for the claimed
+    self_id (if genotyped) so callers get both the identity scan AND contamination-vs-
+    claimed, plus a ranking of the closest individuals.
+
+    Vectorized: per_marker = sum_k1 genoProb[k1] * G[k1], where G[i,k1] = sum_k2
+    exp(seg)[i,k1,k2]*gf[k2] depends only on alpha (not the individual). So at each
+    grid alpha we build four per-marker templates (genotype 0/1/2/3) once and gather
+    them by the (markers x samples) genotype matrix -- the whole 278-sample x 290k-
+    marker scan is then a handful of array ops instead of a Python loop per sample.
+    Mathematically identical to optimize(chip_weights(geno)) per individual.
+
+    Returns dict: best=(id,chipmix,lk1,lk0); self=(...)|None; ranking=[(id,alpha,lk1)].
+    """
+    tbl = pq.read_table(chip_matrix_path)
+    sample_ids = tbl.schema.names
+    uniq, gf = d["uniq"], d["gf"]                   # reads-markers, HWE prior (nu,3)
+    gmat = np.column_stack([np.asarray(tbl.column(s), dtype=np.int8)[uniq]
+                            for s in sample_ids])    # (nu, n_samples) genotype codes
+    nu, nsamp = gmat.shape
+    ge = GENO_ERROR
+    gp = np.array([1 - ge, ge / 2, ge / 2,          # rows homref/het/homalt (code 1/2/3)
+                   ge / 2, 1 - ge, ge / 2,
+                   ge / 2, ge / 2, 1 - ge]).reshape(3, 3)
+
+    alphas = np.arange(0.0, max_alpha + 1e-9, grid)
+    lkmat = np.empty((len(alphas), nsamp))
+    for ai, a in enumerate(alphas):
+        segE = np.exp(_seg(1.0 - a, d)).reshape(nu, 3, 3)
+        G = (segE * gf[:, None, :]).sum(axis=2)     # (nu,3): sum_k2 segE*gf
+        T = np.empty((nu, 4))
+        T[:, 0] = (gf * G).sum(axis=1)              # code 0 (missing) -> HWE on k1
+        T[:, 1:] = G @ gp.T                          # codes 1/2/3 -> genoProb on k1
+        P = T[np.arange(nu)[:, None], gmat]          # (nu,nsamp) gather by genotype
+        lkmat[ai] = -np.log(P).sum(axis=0)
+    grid_alpha = lkmat.argmin(axis=0)                # per-sample grid argmin index
+    min_alpha = alphas[grid_alpha]
+    min_lk = lkmat[grid_alpha, np.arange(nsamp)]
+    order = np.lexsort((min_lk, min_alpha))          # best = lowest alpha, then lowest lk
+
+    def _result(j):
+        sid = sample_ids[j]
+        w = chip_weights(d, np.asarray(tbl.column(sid), dtype=np.int8))
+        return (sid, *_refine_alpha(d, w, alphas, lkmat[:, j]))
+
+    best = _result(int(order[0]))
+    self_res = _result(sample_ids.index(self_id)) if self_id in sample_ids else None
+    ranking = [(sample_ids[j], round(float(min_alpha[j]), 4), round(float(min_lk[j]), 2))
+               for j in order[:top]]
+    return dict(best=best, self=self_res, ranking=ranking)
 
 
 def extract_self_geno(chip_vcf, sample_id, markers_path):
@@ -221,12 +254,19 @@ def main(argv=None):
     if a.best:
         if not a.chip_matrix:
             sys.exit("--best requires --chip-matrix (it scans all individuals' genotypes)")
-        best_id, bmix, blk1, blk0 = optimize_best(d, a.chip_matrix, grid=a.grid)
-        chip = [f"{bmix:.5f}", f"{blk1:.2f}", f"{blk0:.2f}"]
-        chip_id_out = best_id
-        swap = "" if best_id == a.seq_id else "  ** SWAP: best-match != seq-id **"
-        print(f"BEST_MATCH={best_id}  CHIPMIX={chip[0]}  CHIPLK1={chip[1]}  "
-              f"CHIPLK0={chip[2]}{swap}", file=sys.stderr)
+        self_id = a.chip_id or a.seq_id
+        res = scan_chip(d, a.chip_matrix, self_id=self_id, grid=a.grid)
+        best_id = res["best"][0]
+        if res["self"] is not None:               # CHIPMIX columns = vs CLAIMED self
+            _, cmix, clk1, clk0 = res["self"]
+            chip = [f"{cmix:.5f}", f"{clk1:.2f}", f"{clk0:.2f}"]
+            chip_id_out = self_id
+            swap = "NO" if best_id == self_id else "YES"
+        else:
+            swap = "NA"                            # claimed id not genotyped -> unconfirmable
+        rank = "; ".join(f"{i}:{al}" for i, al, _ in res["ranking"])
+        print(f"BEST_MATCH={best_id}  SWAP={swap}  best_chipmix={res['best'][1]:.5f}  "
+              f"self_chipmix={chip[0]}  top={rank}", file=sys.stderr)
     elif a.chip_matrix or a.chip_vcf:
         if a.chip_matrix:
             from . import build_chip
