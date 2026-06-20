@@ -44,9 +44,28 @@ EXCLUDE_FLAG = 0x0704  # unmapped | secondary | qcfail | duplicate
 DEFAULTS = dict(min_mapq=10, min_q=13, max_q=40, max_depth=20)
 
 
+# CA bundle locations across distros — pysam's bundled libcurl needs one set
+# explicitly to verify https (presigned S3) or it fails with an opaque I/O error.
+_CA_CANDIDATES = (
+    "/etc/ssl/certs/ca-certificates.crt",   # Debian / Ubuntu
+    "/etc/pki/tls/certs/ca-bundle.crt",     # RHEL / Rocky / CentOS / Fedora
+    "/etc/ssl/cert.pem",                    # Alpine / some BSD/macOS
+    "/etc/pki/tls/cert.pem",
+)
+
+
+def _ensure_ca_bundle():
+    if os.environ.get("CURL_CA_BUNDLE") or os.environ.get("SSL_CERT_FILE"):
+        return
+    for p in _CA_CANDIDATES:
+        if os.path.exists(p):
+            os.environ["CURL_CA_BUNDLE"] = p
+            return
+
+
 def open_cram(cram_url: str, ref: str, crai_url: str | None):
     if cram_url.startswith(("http://", "https://", "s3://")):
-        os.environ.setdefault("CURL_CA_BUNDLE", "/etc/ssl/certs/ca-certificates.crt")
+        _ensure_ca_bundle()
     kw = {"index_filename": crai_url} if crai_url else {}
     return pysam.AlignmentFile(cram_url, "rc", reference_filename=ref, **kw)
 
