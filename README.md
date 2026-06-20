@@ -33,7 +33,9 @@ biallelic, AF>=0.01 one-sided, callRate>=0.50, AF from genotypes via the exact
 `computeAlleleCounts`/`setSample` semantics). The panel is shared across all samples.
 
 Optional sparse "fast-mode" panel (≈20k common, well-spaced SNPs) so targeted `.crai`
-fetches skip slices — ~20x less data with the contamination call preserved:
+fetches skip slices, with the contamination call preserved. The saving is real but
+modest — **measured ~14 GB of a ~19 GB CRAM (~25%)**, because 20k markers sit ~155 kb
+apart genome-wide and still touch most CRAM slices (see "Scaling / egress" below):
 
 ```bash
 uv run downsample --panel panel.parquet --out fast20k.parquet -n 20000 --min-maf 0.10
@@ -47,8 +49,8 @@ uv run verifybamid \
   --ref  GRCh38_full_analysis_set_plus_decoy_hla.fa \
   --panel panel.parquet \
   --out  results/sample \               # writes results/sample.selfSM
-  --jobs 18 \
-  [--max-span 150000] \                 # set with a downsampled panel (targeted fetch)
+  --jobs 4 \                            # streaming is WAN-bandwidth-bound, not CPU-bound
+  [--max-span 1000000] \                # with a downsampled panel; 1M is the egress optimum
   [--chip-vcf cohort.vcf.gz]            # also compute CHIPMIX if the sample is in it
 ```
 
@@ -71,6 +73,40 @@ and `FREEMIX` (which needs no per-sample genotypes) is the contamination estimat
 | `pileup` | stream CRAM → per-marker base/quality pileup |
 | `estimate` | pileup → FREEMIX/FREELK (+CHIPMIX) |
 | `verifybamid` | end-to-end: CRAM → .selfSM |
+
+## Scaling / egress
+
+Measured on a real HPC node streaming from S3 over the WAN (fast 20k panel,
+`max_span=1M`, bytes counted off the NIC):
+
+| metric | value | note |
+|---|---|---|
+| egress / sample | **~14.3 GB** | of a ~19 GB CRAM → ~25% saving, not order-of-magnitude |
+| `max_span` optimum | **1,000,000** | tighter re-downloads shared CRAM slices; uncapped pulls marker-free gaps |
+| `fast_n` lever | sub-linear | 20k→5k markers saves only ~30% egress, for real accuracy loss |
+| WAN aggregate | **~600 Mbit/s** (~75 MB/s) | the hard ceiling; saturated by a few concurrent streams |
+
+**The binding constraint at scale is WAN bandwidth, not CPU.** Per-sample wall time and
+core count barely matter: 10 concurrent streams on one node each slow ~7× because they
+share the same ~75 MB/s pipe. The coverage guard catches streams that silently
+under-read when the link is oversubscribed.
+
+Projected for **100k samples** streaming on-prem:
+
+- egress ≈ 14.3 GB × 100k ≈ **1.4 PB**
+- transfer time ≈ 1.4 PB ÷ 75 MB/s ≈ **~7 months of continuous WAN transfer**, *regardless
+  of how many cores or nodes you throw at it* — it's bandwidth-bound
+- plus S3 internet-egress cost on ~1.4 PB if not pulled in-region
+
+Practical levers, biggest first:
+
+1. **Run compute in-region (AWS).** Egress becomes free and the pipe becomes multi-Gbps;
+   the 7-month WAN bottleneck collapses to days. This is by far the largest lever.
+2. **Fatter S3↔HPC link** (Direct Connect / more WAN) — improvement is ~linear in Gbps.
+3. **Keep per-node concurrency low** (2–4 streams) so you stay under the throttle/coverage
+   cliff; adding more just inflates per-sample latency without raising throughput.
+4. Fewer markers / a spatially-clustered panel would cut egress further, but the first
+   trades accuracy and the second needs validation that the contamination model holds.
 
 ## Notes
 

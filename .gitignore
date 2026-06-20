@@ -14,3 +14,11 @@ panels/
 *.pileup.parquet
 *.markers.parquet
 *.selfSM
+
+# Nextflow run state + scratch (regenerated each run)
+work/
+.nextflow/
+.nextflow.log*
+nf_run.*
+results/
+scratch/

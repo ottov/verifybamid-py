@@ -15,12 +15,19 @@
  *   - each CRAM is one independent SLURM task that STREAMS from S3 (no full
  *     download); -resume skips completed samples after any failure/preemption;
  *   - fast mode (downsampled panel + targeted .crai fetch) is the default to
- *     minimise S3 egress to the cluster (~1GB vs ~25GB per CRAM).
+ *     cut S3 egress to the cluster. MEASURED: ~13-15 GB per ~19 GB CRAM at the
+ *     20k panel (markers are ~155 kb apart genome-wide, so targeted fetch still
+ *     touches most CRAM slices) -- a ~25% saving over a full download, not the
+ *     order-of-magnitude one might assume. At 100k samples this WAN egress, not
+ *     CPU, is the binding constraint; see README "Scaling / egress".
  */
 
 nextflow.enable.dsl = 2
 
-def mtag = params.fast ? "fast${params.fast_n}" : "full"
+// marker-set tag woven into cached artifact names (fast vs full panel).
+// A function, not a top-level variable: strict DSL (NF >=25) forbids
+// statements outside process/workflow/function declarations.
+def mtag() { params.fast ? "fast${params.fast_n}" : "full" }
 
 workflow {
     rows = Channel.fromPath(params.samples)
@@ -64,7 +71,7 @@ process PANEL {
     tuple val(prefix), val(pname)
 
     output:
-    tuple val(prefix), path("${pname}.${mtag}.panel.parquet")
+    tuple val(prefix), path("${pname}.${mtag()}.panel.parquet")
 
     script:
     if (params.fast)
@@ -72,12 +79,12 @@ process PANEL {
         aws s3 cp ${prefix}.vcf.gz panel.vcf.gz --region ${params.region}
         ${params.bindir}/build-panel --vcf panel.vcf.gz --out full.parquet
         ${params.bindir}/downsample --panel full.parquet \
-            --out ${pname}.${mtag}.panel.parquet -n ${params.fast_n} --min-maf ${params.min_maf}
+            --out ${pname}.${mtag()}.panel.parquet -n ${params.fast_n} --min-maf ${params.min_maf}
         """
     else
         """
         aws s3 cp ${prefix}.vcf.gz panel.vcf.gz --region ${params.region}
-        ${params.bindir}/build-panel --vcf panel.vcf.gz --out ${pname}.${mtag}.panel.parquet
+        ${params.bindir}/build-panel --vcf panel.vcf.gz --out ${pname}.${mtag()}.panel.parquet
         """
 }
 
@@ -96,14 +103,14 @@ process CHIP {
     tuple val(prefix), path(panel)
 
     output:
-    tuple val(prefix), path("${pname}.${mtag}.chip.parquet")
+    tuple val(prefix), path("${pname}.${mtag()}.chip.parquet")
 
     script:
     pname = prefix.tokenize('/').last()
     """
     aws s3 cp ${prefix}.vcf.gz panel.vcf.gz --region ${params.region}
     ${params.bindir}/build-chip --vcf panel.vcf.gz --panel ${panel} \
-        --out ${pname}.${mtag}.chip.parquet
+        --out ${pname}.${mtag()}.chip.parquet
     """
 }
 
