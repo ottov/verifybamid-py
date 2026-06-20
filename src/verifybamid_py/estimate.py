@@ -86,6 +86,44 @@ def chip_weights(d, self_geno, geno_error=GENO_ERROR):
     return (genoprob[:, :, None] * gf[:, None, :]).reshape(nu, 9)  # w1[k1]*w2[k2]
 
 
+def optimize_best(d, chip_matrix_path, grid=0.05, max_alpha=0.95):
+    """Scan every individual in the chip matrix and return the best-matching one.
+
+    Replicates verifyBamID --best (Main.cpp:319-353): the best match is the
+    individual giving the highest IBD = lowest contamination alpha. The per-marker
+    base likelihood (seg) depends only on alpha, not the individual, so it is
+    precomputed once at the grid points and reused across all individuals (cheap
+    weight-combine each) -- making the all-vs-one scan affordable.
+
+    Returns (best_id, chipmix, chiplk1, chiplk0).
+    """
+    tbl = pq.read_table(chip_matrix_path)
+    sample_ids = tbl.schema.names
+    alphas = np.arange(0.0, max_alpha + 1e-9, grid)
+    seg_e = [np.exp(_seg(1.0 - a, d)) for a in alphas]   # precomputed, shared
+
+    best_id = best_k = None
+    best_alpha = best_lks = None
+    for sid in sample_ids:
+        w = chip_weights(d, np.asarray(tbl.column(sid), dtype=np.int8))
+        lks = np.array([-np.log((se * w).sum(axis=1)).sum() for se in seg_e])
+        k = int(lks.argmin())
+        if best_alpha is None or alphas[k] < best_alpha:
+            best_id, best_k, best_alpha, best_lks = sid, k, alphas[k], lks
+
+    # Brent-refine contamination for the winning individual
+    w = chip_weights(d, np.asarray(tbl.column(best_id), dtype=np.int8))
+    llk0 = float(best_lks[0])
+    lo = alphas[max(best_k - 1, 0)]
+    hi = alphas[min(best_k + 1, len(alphas) - 1)]
+    res = minimize_scalar(lambda a: neg_llk(1.0 - a, d, w), bounds=(lo, hi),
+                          method="bounded", options={"xatol": 1e-4})
+    chipmix, chiplk1 = float(res.x), float(res.fun)
+    if chiplk1 > llk0:
+        chipmix, chiplk1 = 0.0, llk0
+    return best_id, chipmix, chiplk1, llk0
+
+
 def _seg(fmix, d):
     """markerLK in log space, (nu, 9) -- shared by FREE and CHIP."""
     A = (fmix * PSN_REF[:, None] + (1 - fmix) * PSN_REF[None, :]).ravel()
@@ -168,6 +206,9 @@ def main(argv=None):
     ap.add_argument("--chip-vcf", help="VCF with the sample's genotypes -> enables CHIPMIX")
     ap.add_argument("--chip-matrix", help="precomputed chip matrix (build-chip) -> CHIPMIX")
     ap.add_argument("--chip-id", help="sample id in chip source (default: --seq-id)")
+    ap.add_argument("--best", action="store_true",
+                    help="(optional) scan all chip-matrix individuals for the best-matching "
+                         "ID -> identity / sample-swap check; requires --chip-matrix")
     ap.add_argument("--max-q", type=int, default=40)
     ap.add_argument("--grid", type=float, default=0.05)
     a = ap.parse_args(argv)
@@ -176,7 +217,17 @@ def main(argv=None):
     freemix, freelk1, freelk0 = optimize(d, d["gfo"], grid=a.grid, max_alpha=0.5)
 
     chip = ["NA", "NA", "NA"]
-    if a.chip_matrix or a.chip_vcf:
+    chip_id_out = "NA"
+    if a.best:
+        if not a.chip_matrix:
+            sys.exit("--best requires --chip-matrix (it scans all individuals' genotypes)")
+        best_id, bmix, blk1, blk0 = optimize_best(d, a.chip_matrix, grid=a.grid)
+        chip = [f"{bmix:.5f}", f"{blk1:.2f}", f"{blk0:.2f}"]
+        chip_id_out = best_id
+        swap = "" if best_id == a.seq_id else "  ** SWAP: best-match != seq-id **"
+        print(f"BEST_MATCH={best_id}  CHIPMIX={chip[0]}  CHIPLK1={chip[1]}  "
+              f"CHIPLK0={chip[2]}{swap}", file=sys.stderr)
+    elif a.chip_matrix or a.chip_vcf:
         if a.chip_matrix:
             from . import build_chip
             sg = build_chip.load_sample(a.chip_matrix, a.chip_id or a.seq_id)
@@ -186,11 +237,12 @@ def main(argv=None):
             w = chip_weights(d, sg)
             chipmix, chiplk1, chiplk0 = optimize(d, w, grid=a.grid, max_alpha=0.95)
             chip = [f"{chipmix:.5f}", f"{chiplk1:.2f}", f"{chiplk0:.2f}"]
+            chip_id_out = a.chip_id or a.seq_id
             print(f"CHIPMIX={chip[0]}  CHIPLK1={chip[1]}  CHIPLK0={chip[2]}", file=sys.stderr)
 
     print(f"FREEMIX={freemix:.5f}  FREELK1={freelk1:.2f}  FREELK0={freelk0:.2f}",
           file=sys.stderr)
-    cols = [a.seq_id, "ALL", "NA", str(d["n_markers"]), "NA", "NA",
+    cols = [a.seq_id, "ALL", chip_id_out, str(d["n_markers"]), "NA", "NA",
             f"{freemix:.5f}", f"{freelk1:.2f}", f"{freelk0:.2f}", "NA", "NA",
             chip[0], chip[1], chip[2], "NA", "NA", "NA", "NA", "NA"]
     print("\t".join(cols))
