@@ -232,8 +232,15 @@ def run(cram_url, ref, panel_path, *, crai_url=None, out=None, contigs=None,
     avg_dp = total_reads / n_snps if n_snps else 0.0
     hist = np.bincount(np.minimum(depth, f["max_depth"]), minlength=f["max_depth"] + 1)
 
+    # Coverage sanity guard. Markers on a CRAM contig should almost all get reads in
+    # real WGS; a low covered-fraction means the stream silently under-read (network
+    # degradation/throttling that htslib didn't raise on) -> the result is garbage.
+    covered = int((depth > 0).sum())
+    covered_frac = covered / n_work if n_work else 0.0
+
     print(f"\n#SNPS={n_snps:,}  #READS={total_reads:,}  AVG_DP={avg_dp:.2f}  "
-          f"({time.time()-t0:.0f}s)", file=sys.stderr)
+          f"covered={covered:,}/{n_work:,} ({covered_frac:.3f})  ({time.time()-t0:.0f}s)",
+          file=sys.stderr)
     print("depth histogram (depth: nSNPs):", file=sys.stderr)
     for d in range(f["max_depth"], -1, -1):
         if hist[d]:
@@ -250,7 +257,8 @@ def run(cram_url, ref, panel_path, *, crai_url=None, out=None, contigs=None,
                        f"{out}.markers.parquet")
         print(f"\nwrote {out}.pileup.parquet and {out}.markers.parquet", file=sys.stderr)
 
-    return dict(n_snps=n_snps, n_reads=total_reads, avg_dp=avg_dp)
+    return dict(n_snps=n_snps, n_reads=total_reads, avg_dp=avg_dp,
+                n_oncontig=n_work, covered=covered, covered_frac=covered_frac)
 
 
 def main(argv=None):

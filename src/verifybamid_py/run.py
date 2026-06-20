@@ -69,6 +69,9 @@ def main(argv=None):
                    help="(optional) identity/sample-swap check: best-matching individual "
                         "in the chip matrix; requires --chip-matrix")
     p.add_argument("--jobs", type=int, default=1)
+    p.add_argument("--min-cov-frac", type=float, default=0.80,
+                   help="fail if fewer than this fraction of on-contig markers get reads "
+                        "(catches silently-degraded S3 streams); default 0.80")
     p.add_argument("--contig", action="append", dest="contigs",
                    help="restrict to contig(s); repeatable (mainly for testing)")
     p.add_argument("--max-span", type=int,
@@ -93,6 +96,15 @@ def main(argv=None):
                         jobs=a.jobs, contigs=a.contigs, max_span=a.max_span,
                         min_mapq=a.min_mapq, min_q=a.min_q, max_q=a.max_q,
                         max_depth=a.max_depth)
+
+    # Coverage guard: real WGS covers ~all on-contig markers. A low fraction means the
+    # S3 stream silently under-read (network throttle/degradation htslib didn't raise);
+    # fail nonzero so the orchestrator retries instead of recording garbage.
+    if counts["covered_frac"] < a.min_cov_frac:
+        sys.exit(f"[verifybamid] FAIL: only {counts['covered']:,}/{counts['n_oncontig']:,} "
+                 f"on-contig markers covered ({counts['covered_frac']:.3f} < "
+                 f"--min-cov-frac {a.min_cov_frac}); likely a degraded S3 stream. "
+                 f"Not writing results.")
 
     # Stage 2: estimate
     d = estimate.load(f"{a.out}.markers.parquet", f"{a.out}.pileup.parquet", max_q=a.max_q)
