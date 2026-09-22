@@ -1,4 +1,5 @@
-"""Stage 2: estimate FREEMIX/FREELK (and optionally CHIPMIX/CHIPLK) from the pileup.
+"""Stage 2: estimate FREEMIX/FREELK (and optionally CHIPMIX/CHIPLK) from the pileup,
+or from a VCPA marker table (--table; see table.py).
 
 Replicates verifyBamID 1.1.3:
   * FREE  (--free-mix, default): computeMixLLKs (VerifyBamID.cpp:510-641). The intended
@@ -44,14 +45,24 @@ GENO_ERROR = 1.0e-3
 
 def load(markers_path, pileup_path, max_q=40):
     m = pq.read_table(markers_path)
-    ref = np.array(m.column("ref").to_pylist())
-    alt = np.array(m.column("alt").to_pylist())
-    af = np.asarray(m.column("af"), dtype=np.float64)
-
     p = pq.read_table(pileup_path)
     marker = np.asarray(p.column("marker"), dtype=np.int64)        # sorted ascending
     base = np.array(p.column("base").to_pylist())
     qual = np.asarray(p.column("qual"), dtype=np.float64)
+    return prepare(m, marker, base, qual, max_q=max_q)
+
+
+def prepare(m, marker, base, qual, weight=None, max_q=40):
+    """Per-observation base probabilities and per-marker priors for the likelihood.
+
+    One observation is one read (weight None), or -- from a marker table -- one allele
+    at one marker standing for `weight` reads that share its quality. Since those reads'
+    log-likelihood terms are identical, weight * term is their sum. marker must be
+    sorted ascending.
+    """
+    ref = np.array(m.column("ref").to_pylist())
+    alt = np.array(m.column("alt").to_pylist())
+    af = np.asarray(m.column("af"), dtype=np.float64)
 
     e = np.power(10.0, -np.minimum(qual, max_q) / 10.0)
     matchp = 1.0 - e
@@ -64,7 +75,7 @@ def load(markers_path, pileup_path, max_q=40):
     gf = np.stack([(1 - afc) ** 2, 2 * afc * (1 - afc), afc ** 2], axis=1)  # (nu,3) HWE
     gfo = (gf[:, :, None] * gf[:, None, :]).reshape(len(uniq), 9)            # gf[k1]*gf[k2]
     return dict(n_markers=m.num_rows, pb_ref=pb_ref, pb_alt=pb_alt,
-                starts=starts, uniq=uniq, gf=gf, gfo=gfo)
+                starts=starts, uniq=uniq, gf=gf, gfo=gfo, weight=weight)
 
 
 def chip_weights(d, self_geno, geno_error=GENO_ERROR):
@@ -91,7 +102,10 @@ def _seg(fmix, d):
     A = (fmix * PSN_REF[:, None] + (1 - fmix) * PSN_REF[None, :]).ravel()
     B = (fmix * PSN_ALT[:, None] + (1 - fmix) * PSN_ALT[None, :]).ravel()
     baselk = d["pb_ref"][:, None] * A[None, :] + d["pb_alt"][:, None] * B[None, :]
-    return np.add.reduceat(np.log(baselk), d["starts"], axis=0)
+    logb = np.log(baselk)
+    if d.get("weight") is not None:
+        logb *= d["weight"][:, None]
+    return np.add.reduceat(logb, d["starts"], axis=0)
 
 
 def neg_llk(fmix, d, w):
@@ -254,10 +268,34 @@ def chip_columns(d, *, chip_matrix=None, chip_vcf=None, chip_id=None, seq_id=Non
     return none
 
 
+def _load_table(a):
+    """--table input, refusing a broken shard set or a table too thin to estimate from
+    (an empty pileup still yields a plausible-looking FREEMIX)."""
+    from . import table                            # table builds on prepare() above
+    try:
+        d = table.load(a.markers, a.table, max_q=a.max_q)
+    except table.TableError as e:
+        sys.exit(f"[estimate] FAIL: {e}")
+    stray = f", {d['not_in_panel']:,} rows not in the panel (ignored)" if d["not_in_panel"] else ""
+    print(f"[table] {a.table}: {d['covered']:,}/{d['n_markers']:,} markers covered, "
+          f"{d['n_reads']:,} reads{stray}", file=sys.stderr)
+    frac = d["covered"] / d["n_markers"]
+    if frac < a.min_cov_frac:
+        sys.exit(f"[estimate] FAIL: only {d['covered']:,}/{d['n_markers']:,} panel markers "
+                 f"covered ({frac:.3f} < --min-cov-frac {a.min_cov_frac}). Not writing results.")
+    return d
+
+
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="Estimate FREEMIX/FREELK (+CHIPMIX) from pileup.")
+    ap = argparse.ArgumentParser(description="Estimate FREEMIX/FREELK (+CHIPMIX) from a pileup or a marker table.")
     ap.add_argument("--markers", required=True, help="<prefix>.markers.parquet")
-    ap.add_argument("--pileup", required=True, help="<prefix>.pileup.parquet")
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument("--pileup", help="<prefix>.pileup.parquet")
+    src.add_argument("--table", help="VCPA marker table: <SM>.ad.tsv.gz, a shard manifest, "
+                                     "a directory holding one, or an s3:// shard prefix/manifest")
+    ap.add_argument("--min-cov-frac", type=float, default=0.80,
+                    help="--table: fail if fewer than this fraction of panel markers are "
+                         "covered; default 0.80")
     ap.add_argument("--seq-id", default="SAMPLE")
     ap.add_argument("--chip-vcf", help="VCF with the sample's genotypes -> enables CHIPMIX")
     ap.add_argument("--chip-matrix", help="precomputed chip matrix (build-chip) -> CHIPMIX")
@@ -269,7 +307,12 @@ def main(argv=None):
     ap.add_argument("--grid", type=float, default=0.05)
     a = ap.parse_args(argv)
 
-    d = load(a.markers, a.pileup, max_q=a.max_q)
+    if a.table:
+        d = _load_table(a)
+        reads, avg_dp = str(d["n_reads"]), f"{d['n_reads'] / d['n_markers']:.2f}"
+    else:
+        d = load(a.markers, a.pileup, max_q=a.max_q)
+        reads, avg_dp = "NA", "NA"
     freemix, freelk1, freelk0 = optimize(d, d["gfo"], grid=a.grid, max_alpha=0.5)
 
     chip, chip_id_out, scan, swap = chip_columns(
@@ -284,7 +327,7 @@ def main(argv=None):
 
     print(f"FREEMIX={freemix:.5f}  FREELK1={freelk1:.2f}  FREELK0={freelk0:.2f}",
           file=sys.stderr)
-    cols = [a.seq_id, "ALL", chip_id_out, str(d["n_markers"]), "NA", "NA",
+    cols = [a.seq_id, "ALL", chip_id_out, str(d["n_markers"]), reads, avg_dp,
             f"{freemix:.5f}", f"{freelk1:.2f}", f"{freelk0:.2f}", "NA", "NA",
             chip[0], chip[1], chip[2], "NA", "NA", "NA", "NA", "NA"]
     print("\t".join(cols))

@@ -110,6 +110,29 @@ uv run verifybamid \
 For `s3://` inputs the CRAM and its `.crai` are presigned via boto3 (region from
 `--region` / `AWS_REGION`, default `us-east-1`). Run **in-region** for free, fast egress.
 
+### Estimate from a VCPA marker table
+
+The VCPA pipeline's marker pileup already records, per panel marker, the depth and
+phred sum of each allele. `estimate --table` reads that directly -- no CRAM access,
+~5 s per sample:
+
+```bash
+uv run estimate --markers markers.parquet --seq-id SM \
+  --table SM.ad.tsv.gz                     # full table
+  # or  --table SM.markers.manifest.tsv    # shard set, via its manifest
+  # or  --table path/to/markers/           # directory holding one manifest
+  # or  --table s3://bucket/.../markers/   # shard set on S3 (prefix or manifest key)
+```
+
+Table rows are `chrom pos ref alt refDepth altDepth refQsum altQsum`. Each allele is
+scored at its mean quality `round(Qsum/depth)`, weighted by its depth, which gives
+the same likelihood as expanding it to one pileup row per read. A shard set is read
+only through its manifest and must match it exactly: every shard present with the
+recorded bytes and rows, and the manifest covering the whole panel. Otherwise
+`estimate` exits non-zero without a result. So does a table covering fewer than
+`--min-cov-frac` (default 0.80) of panel markers, since an empty pileup still
+produces a plausible-looking FREEMIX. `#READS` and `AVG_DP` are filled from the table.
+
 ## CHIPMIX
 
 CHIPMIX needs the sample's own genotypes (it compares reads against a known genotype).
@@ -124,7 +147,7 @@ and `FREEMIX` (which needs no per-sample genotypes) is the contamination estimat
 | `build-panel` | population VCF → marker panel (chrom,pos,ref,alt,af) |
 | `downsample` | full panel → sparse fast-mode panel |
 | `pileup` | stream CRAM → per-marker base/quality pileup |
-| `estimate` | pileup → FREEMIX/FREELK (+CHIPMIX) |
+| `estimate` | pileup or VCPA marker table → FREEMIX/FREELK (+CHIPMIX) |
 | `verifybamid` | end-to-end: CRAM → .selfSM |
 
 ## Scaling / egress
