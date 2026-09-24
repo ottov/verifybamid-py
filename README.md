@@ -124,6 +124,7 @@ with `-resume`. Samples in progress when you stop it are cancelled and re-run.
 | `sbatch` rejects the partition | The bundled `defaultq` doesn't exist on your cluster. Set `process.queue` in `site.config`. |
 | `aws: command not found` in `PANEL` / `CHIP` | Set `beforeScript` in `site.config`. |
 | exit 126, `bad interpreter: Permission denied` | Another user's jobs can't read your uv Python. See step 1. |
+| `Cannot compare java.lang.String with value '16'` | Your checkout predates the fix for Nextflow 26+, where command-line values arrive as text. On those checkouts `--fast false` is also silently ignored. Run `git pull`, or set the values in `site.config` under `params { }`. Mid-batch, use the config: the pull changes the per-sample step, so `-resume` would re-run samples that already finished. |
 | sample fails with `likely a degraded S3 stream` | Its download under-read (coverage guard). Retried automatically; if it's frequent, lower `--max_streams`. |
 
 ## Install (single-sample use)

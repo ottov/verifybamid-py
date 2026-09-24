@@ -24,10 +24,18 @@
 
 nextflow.enable.dsl = 2
 
+// Params given on the command line arrive as Strings under the strict syntax
+// (NF >=26): `--fast false` is the truthy String "false", and
+// `--max_streams 16` fails maxForks with "Cannot compare java.lang.String".
+// Values set in a config file keep their types. So every boolean param goes
+// through asBool(), and numeric directives convert inline (a directive can't
+// call a script function: a bare call there is read as another directive).
+def asBool(v) { v.toString().toBoolean() }
+
 // marker-set tag woven into cached artifact names (fast vs full panel).
 // A function, not a top-level variable: strict DSL (NF >=25) forbids
 // statements outside process/workflow/function declarations.
-def mtag() { params.fast ? "fast${params.fast_n}" : "full" }
+def mtag() { asBool(params.fast) ? "fast${params.fast_n}" : "full" }
 
 workflow {
     rows = Channel.fromPath(params.samples)
@@ -40,7 +48,7 @@ workflow {
 
     PANEL(panel_ch)                                  // (prefix, run_panel.parquet)
 
-    if (params.chipmix) {
+    if (asBool(params.chipmix)) {
         CHIP(PANEL.out)                              // (prefix, chip.parquet)
         artifacts = PANEL.out.join(CHIP.out)         // (prefix, panel, chip)
     } else {
@@ -93,7 +101,7 @@ process PANEL {
     tuple val(prefix), path("${pname}.${mtag()}.panel.parquet")
 
     script:
-    if (params.fast)
+    if (asBool(params.fast))
         """
         aws s3 cp ${prefix}.vcf.gz panel.vcf.gz --region ${params.region}
         ${params.bindir}/build-panel --vcf panel.vcf.gz --out full.parquet
@@ -140,10 +148,10 @@ process CHIP {
 process VERIFYBAMID {
     tag "${sample}"
     publishDir "${params.outdir}", mode: 'copy', pattern: '*.{selfSM,best.tsv}'
-    cpus params.cpus
+    cpus params.cpus.toString().toInteger()
     memory params.mem
     time params.time
-    maxForks params.max_streams            // S3-stream throttle (see config)
+    maxForks params.max_streams.toString().toInteger()   // S3-stream throttle (see config)
     // Retry transient failures (S3 throttle -> coverage-guard exit, preemption);
     // after that, IGNORE so one bad CRAM can't abort a 100k-sample batch. Ignored
     // samples emit no .selfSM and are listed in failed_samples.txt by REPORT.
@@ -159,8 +167,8 @@ process VERIFYBAMID {
 
     script:
     def chip_arg = chip.name == 'NO_CHIP' ? '' :
-                   (params.best ? "--chip-matrix ${chip} --best" : "--chip-matrix ${chip} --chip-id ${sample}")
-    def fast_arg = params.fast ? "--max-span ${params.max_span}" : ''
+                   (asBool(params.best) ? "--chip-matrix ${chip} --best" : "--chip-matrix ${chip} --chip-id ${sample}")
+    def fast_arg = asBool(params.fast) ? "--max-span ${params.max_span}" : ''
     """
     export AWS_REGION=${params.region}
     ${params.bindir}/verifybamid \
