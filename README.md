@@ -13,63 +13,127 @@ on the matching panel and CHIPMIX to 1e-5.
 ## Cluster quickstart (SLURM)
 
 Run a whole project (10,000s of CRAMs sharing one panel) as a Nextflow pipeline that
-submits one streaming SLURM job per sample. Needs **Java 17+, Nextflow, `uv`, and the
-`aws` CLI** on the cluster, plus a **shared filesystem** visible to all compute nodes.
+submits one streaming SLURM job per sample. Needs **Java 17+,
+[Nextflow](https://www.nextflow.io/docs/latest/install.html), [`uv`](https://docs.astral.sh/uv/),
+and the `aws` CLI**, plus a **shared filesystem** that every compute node can see.
+
+### 1. Install (once, on the shared filesystem)
 
 ```bash
-# 1. clone + install
-git clone git@github.com:ottov/verifybamid-py.git
+git clone https://github.com/ottov/verifybamid-py.git
 cd verifybamid-py
 uv sync                       # builds .venv/ with the verifybamid commands
-
-# 2. one-time prerequisites
-ls /shared/ref/GRCh38_full_analysis_set_plus_decoy_hla.fa{,.fai}   # ref + .fai, shared
-aws configure                 # AWS creds readable on COMPUTE nodes (NFS-shared ~/.aws)
-
-# 3. sample sheet: TSV, NO header, tab-separated
-#    sample_id <TAB> s3://bucket/project/PANEL_PREFIX <TAB> s3://bucket/path/sample.cram
-#    (".vcf.gz" is appended to PANEL_PREFIX; the panel is shared by all samples in it)
-
-# 4. launch (submits to SLURM by default); run from the repo root
-nextflow run nextflow/main.nf -c nextflow/nextflow.config \
-  --samples /path/to/sample_list.tsv \
-  --ref     /shared/ref/GRCh38_full_analysis_set_plus_decoy_hla.fa \
-  --bindir  "$PWD/.venv/bin" \
-  --region  us-east-1 \
-  -resume
 ```
 
-The run builds the marker panel + CHIP matrix **once per project** (cached in `panels/`,
-reused on re-runs) and streams each CRAM as an independent SLURM job. Outputs land in
-`results/`:
+If other users will run from your install, keep uv's Python inside the checkout.
+Otherwise `.venv/bin/python` points into your `~/.local/share/uv`, and their jobs fail
+with `bad interpreter: Permission denied` (exit 126):
+
+```bash
+UV_PYTHON_INSTALL_DIR=$PWD/.uv-python uv sync
+chmod -R a+rX .
+```
+
+### 2. Check the prerequisites
+
+- The reference FASTA the CRAMs were aligned to, with its `.fai`, on the shared filesystem.
+- AWS credentials that can read the CRAMs and the panel VCF **from the compute nodes**
+  (e.g. an NFS-shared `~/.aws`). Check with `aws s3 ls s3://bucket/path/sample.cram`.
+
+### 3. Write the sample sheet
+
+Tab-separated, no header, one sample per line:
+
+```
+sample_id <TAB> s3://bucket/project/PANEL_PREFIX <TAB> s3://bucket/path/sample.cram
+```
+
+`PANEL_PREFIX` is the project's population VCF **without** `.vcf.gz`; the pipeline
+appends it. For `s3://bucket/project/cohort.vcf.gz`, column 2 is
+`s3://bucket/project/cohort`. Every sample with the same prefix shares one panel.
+
+### 4. Point it at your cluster
+
+The bundled config submits to a partition named `defaultq`. Put your cluster's settings
+in a small `site.config`; any config file given later on the command line wins:
+
+```groovy
+process {
+    queue          = 'your_partition'
+    clusterOptions = '--qos=your_qos'                    // any extra sbatch flags
+    beforeScript   = 'export PATH=/usr/local/bin:$PATH'  // if aws isn't on the jobs' PATH
+}
+```
+
+### 5. Launch
+
+Launch from a project directory on the shared filesystem. `work/`, `panels/` and
+`results/` are created in the directory you launch from. Use absolute paths to the
+checkout. The Nextflow driver has to run for the whole batch, so start it with `nohup`
+on a login node, or submit it as its own long, 1-CPU job. Don't start it inside an
+interactive session that will end.
+
+```bash
+VBID=/shared/path/to/verifybamid-py
+cd /shared/path/to/project
+
+nohup nextflow run $VBID/nextflow/main.nf \
+  -c $VBID/nextflow/nextflow.config -c site.config \
+  --samples samples.tsv \
+  --ref     /shared/path/to/GRCh38_full_analysis_set_plus_decoy_hla.fa \
+  --bindir  $VBID/.venv/bin \
+  -resume > run.log 2>&1 &
+```
+
+`--ref` and `--bindir` are required: the defaults in `nextflow.config` are one
+developer's paths.
+
+The run builds the marker panel and CHIP matrix **once per panel** (cached in `panels/`
+and reused on re-runs), then streams each CRAM as an independent SLURM job. If the
+driver stops for any reason, run the same command again; `-resume` skips finished samples.
+
+Outputs land in `results/`:
 
 - `contamination.selfSM` — merged table, one row per sample (`FREEMIX`, `FREELK1/0`, `CHIPMIX`, …)
+- `<sample>.selfSM` — one file per sample
 - `failed_samples.txt` — samples that failed after retries (empty if all passed; re-run by
   trimming the sheet to these and re-launching with `-resume`)
-- `_report.html` / `_timeline.html` / `_trace.txt` — run stats
+- `_report.html` / `_timeline.html` / `_trace.txt` — run stats (`_trace.txt` has per-sample durations)
 
-Knobs (as `--flag value`, or edit `nextflow/nextflow.config`):
+### Knobs
+
+Pass as `--flag value` on the command line, or set them in `site.config` under `params { }`.
+`max_streams` is read at launch, so changing it means stopping the driver and relaunching
+with `-resume`. Samples in progress when you stop it are cancelled and re-run.
 
 | flag | default | when to change |
 |---|---|---|
-| `--max_streams` | `8` | concurrent S3 streams. **Raise a lot in-region/AWS**; lower if coverage-guard retries appear over a thin WAN. |
-| `--cpus` | `2` | cores per sample; 2–4 is the sweet spot. |
-| `--chipmix` | `true` | set `false` if the sample isn't in the project genotype VCF (then `FREEMIX` only). |
-| `--fast_n` | `20000` | markers; 20k is well-validated. |
+| `--max_streams` | `8` | CRAMs streaming at once, which is how many samples run at a time. Raise it to go faster; see "Throughput and egress". |
+| `--cpus` | `2` | cores (parallel fetches) per sample; 2–4 is the sweet spot. |
+| `--fast` | `true` | `false` uses the full panel (the same markers as stock verifyBamID): slower, more S3 reads. |
+| `--fast_n` | `20000` | markers in the fast panel; 20k is well-validated. |
+| `--chipmix` | `true` | `false` skips the CHIP matrix. Samples missing from the panel VCF get `CHIPMIX=NA` either way. |
+| `--region` | `us-east-1` | the S3 buckets' region. |
 | `-profile local` | (slurm) | run on one node instead of submitting to SLURM (testing). |
 
-> **It's WAN-bandwidth-bound** (~14 GB/sample), not CPU-bound — see "Scaling / egress"
-> below. `-resume` makes failures/preemptions cheap to recover.
+### Troubleshooting
 
-The rest of this README covers the single-sample / per-stage commands the pipeline calls.
+| symptom | cause |
+|---|---|
+| `Remote resource not found: https://api.github.com/repos/.../main.nf` | The path to `main.nf` doesn't exist from where you launched, so Nextflow looked for a GitHub project with that name. Use the absolute path. |
+| `sbatch` rejects the partition | The bundled `defaultq` doesn't exist on your cluster. Set `process.queue` in `site.config`. |
+| `aws: command not found` in `PANEL` / `CHIP` | Set `beforeScript` in `site.config`. |
+| exit 126, `bad interpreter: Permission denied` | Another user's jobs can't read your uv Python. See step 1. |
+| sample fails with `likely a degraded S3 stream` | Its download under-read (coverage guard). Retried automatically; if it's frequent, lower `--max_streams`. |
 
-## Install
+## Install (single-sample use)
 
 ```bash
 uv sync
 ```
 
 Requires a local reference FASTA (same one the CRAMs were aligned to) to decode CRAM.
+The rest of this README covers the single-sample / per-stage commands the pipeline calls.
 
 ## Pipeline
 
@@ -88,7 +152,7 @@ biallelic, AF>=0.01 one-sided, callRate>=0.50, AF from genotypes via the exact
 Optional sparse "fast-mode" panel (≈20k common, well-spaced SNPs) so targeted `.crai`
 fetches skip slices, with the contamination call preserved. The saving is real but
 modest — **measured ~14 GB of a ~19 GB CRAM (~25%)**, because 20k markers sit ~155 kb
-apart genome-wide and still touch most CRAM slices (see "Scaling / egress" below):
+apart genome-wide and still touch most CRAM slices (see "Throughput and egress" below):
 
 ```bash
 uv run downsample --panel panel.parquet --out fast20k.parquet -n 20000 --min-maf 0.10
@@ -98,14 +162,18 @@ uv run downsample --panel panel.parquet --out fast20k.parquet -n 20000 --min-maf
 
 ```bash
 uv run verifybamid \
-  --cram s3://bucket/sample.cram \      # local path, s3:// URI, or presigned https URL
-  --ref  GRCh38_full_analysis_set_plus_decoy_hla.fa \
+  --cram  s3://bucket/sample.cram \
+  --ref   GRCh38_full_analysis_set_plus_decoy_hla.fa \
   --panel panel.parquet \
-  --out  results/sample \               # writes results/sample.selfSM
-  --jobs 4 \                            # streaming is WAN-bandwidth-bound, not CPU-bound
-  [--max-span 1000000] \                # with a downsampled panel; 1M is the egress optimum
-  [--chip-vcf cohort.vcf.gz]            # also compute CHIPMIX if the sample is in it
+  --out   results/sample \
+  --jobs  4
 ```
+
+- `--cram` takes a local path, an `s3://` URI, or a presigned https URL.
+- Writes `results/sample.selfSM`.
+- `--jobs` is parallel fetches; streaming is bandwidth-bound, not CPU-bound.
+- With a downsampled panel, add `--max-span 1000000` (the measured egress optimum).
+- Add `--chip-vcf cohort.vcf.gz` to also compute CHIPMIX if the sample is in it.
 
 For `s3://` inputs the CRAM and its `.crai` are presigned via boto3 (region from
 `--region` / `AWS_REGION`, default `us-east-1`). Run **in-region** for free, fast egress.
@@ -146,46 +214,59 @@ and `FREEMIX` (which needs no per-sample genotypes) is the contamination estimat
 |---|---|
 | `build-panel` | population VCF → marker panel (chrom,pos,ref,alt,af) |
 | `downsample` | full panel → sparse fast-mode panel |
+| `build-chip` | genotype VCF + panel → per-sample genotype matrix for CHIPMIX |
 | `pileup` | stream CRAM → per-marker base/quality pileup |
 | `estimate` | pileup or VCPA marker table → FREEMIX/FREELK (+CHIPMIX) |
 | `verifybamid` | end-to-end: CRAM → .selfSM |
 
-## Scaling / egress
+## Throughput and egress
 
-Measured on a real HPC node streaming from S3 over the WAN (fast 20k panel,
-`max_span=1M`, bytes counted off the NIC):
+Measured streaming from S3 to on-premises SLURM nodes (fast 20k panel, `max_span=1M`,
+bytes counted off the NIC):
 
 | metric | value | note |
 |---|---|---|
 | egress / sample | **~14.3 GB** | of a ~19 GB CRAM → ~25% saving, not order-of-magnitude |
 | `max_span` optimum | **1,000,000** | tighter re-downloads shared CRAM slices; uncapped pulls marker-free gaps |
 | `fast_n` lever | sub-linear | 20k→5k markers saves only ~30% egress, for real accuracy loss |
-| WAN aggregate | **~600 Mbit/s** (~75 MB/s) | the hard ceiling; saturated by a few concurrent streams |
+| one stream | **~70 Mbit/s** | ~20–30 min per sample at `--cpus 2` |
 
-**The binding constraint at scale is WAN bandwidth, not CPU.** Per-sample wall time and
-core count barely matter: 10 concurrent streams on one node each slow ~7× because they
-share the same ~75 MB/s pipe. The coverage guard catches streams that silently
-under-read when the link is oversubscribed.
+Throughput is streams × per-stream rate. It stops scaling when one of two links fills:
 
-Projected for **100k samples** streaming on-prem:
+- **Each node's network link.** Slurm packs samples onto nodes: at `--cpus 2`, an 8-CPU
+  node takes 4 of them (~280 Mbit/s). A 1 Gbit/s node tops out around 600 Mbit/s in
+  practice, so 10 streams on one node each ran several times slower. Check placement
+  with `squeue -u $USER -o %N`.
+- **The site's path to S3.** This is shared by every node. On-premises, it was not the
+  limit at ~900 Mbit/s across four nodes: the streams already running kept their full
+  rate. Its real ceiling depends on your site.
 
-- egress ≈ 14.3 GB × 100k ≈ **1.4 PB**
-- transfer time ≈ 1.4 PB ÷ 75 MB/s ≈ **~7 months of continuous WAN transfer**, *regardless
-  of how many cores or nodes you throw at it* — it's bandwidth-bound
-- plus S3 internet-egress cost on ~1.4 PB if not pulled in-region
+To tune `--max_streams`, raise it in steps (8 → 16 → 24), relaunching with `-resume`
+each time. After each step, check the per-sample durations in `results/_trace.txt`. If
+they stay flat, the extra streams are adding throughput. If they rise, or samples start
+failing the coverage guard, you've hit a ceiling; go back a step.
+
+Egress is the same whatever the concurrency; only the finish date changes. Projected for
+**100k samples**:
+
+- egress ≈ 14.3 GB × 100k ≈ **1.4 PB**, billed as S3 internet egress when pulled out of region
+- transfer time ≈ 1.4 PB ÷ aggregate bandwidth: **~7 months at 600 Mbit/s, ~4.4 months
+  at 1 Gbit/s, ~2 weeks at 10 Gbit/s**
 
 Practical levers, biggest first:
 
-1. **Run compute in-region (AWS).** Egress becomes free and the pipe becomes multi-Gbps;
-   the 7-month WAN bottleneck collapses to days. This is by far the largest lever.
-2. **Fatter S3↔HPC link** (Direct Connect / more WAN) — improvement is ~linear in Gbps.
-3. **Keep per-node concurrency low** (2–4 streams) so you stay under the throttle/coverage
-   cliff; adding more just inflates per-sample latency without raising throughput.
-4. Fewer markers / a spatially-clustered panel would cut egress further, but the first
+1. **Run compute in-region (AWS).** Egress becomes free and each node gets multi-Gbps to
+   S3, so months become days. This is by far the largest lever.
+2. **More aggregate bandwidth on-prem:** spread streams across more nodes (a few per
+   1 Gbit/s node) until the site's path to S3 fills; beyond that, a fatter S3↔site link
+   (Direct Connect / more WAN) helps roughly linearly.
+3. Fewer markers / a spatially-clustered panel would cut egress further, but the first
    trades accuracy and the second needs validation that the contamination model holds.
 
 ## Notes
 
 - Deliverable columns: `FREEMIX`, `FREELK1`, `FREELK0`, and `CHIPMIX`/`CHIPLK*` when
   genotypes are available; reference-bias columns are fixed (`--free-mix` mode) and emit `NA`.
-- The reference C++ source (read to match behavior exactly) lives at `../git/verifybamid`.
+- Behavior follows the verifyBamID 1.1.3 C++ source
+  ([statgen/verifyBamID](https://github.com/statgen/verifyBamID)), which was read to
+  match it exactly.
